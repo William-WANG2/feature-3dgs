@@ -192,6 +192,12 @@ Run the following to export the image embeddings of an input image or directory 
 cd encoders/sam_encoder
 python export_image_embeddings.py --checkpoint checkpoints/sam_vit_h_4b8939.pth --model-type vit_h --input ../../data/DATASET_NAME/images  --output ../../data/OUTPUT_NAME/sam_embeddings
 ```
+```
+cd encoders/sam_encoder
+python export_image_embeddings.py --checkpoint checkpoints/sam_vit_h_4b8939.pth --model-type vit_h --input ../../data/nerf_synthetic/lego/test/  --output ../../data/nerf_synthetic/lego/sam_embeddings/test/
+python export_image_embeddings.py --checkpoint checkpoints/sam_vit_h_4b8939.pth --model-type vit_h --input ../../data/nerf_synthetic/lego/train/  --output ../../data/nerf_synthetic/lego/sam_embeddings/train/
+```
+
 
 
 
@@ -232,6 +238,9 @@ and then
 ## Train
 ```
 python train.py -s data/DATASET_NAME -m output/OUTPUT_NAME -f lseg --speedup --iterations 7000
+```
+```
+python train.py -s data/nerf_synthetic/lego -m output/nerf_synthetic/lego -f sam --speedup --iterations 7000
 ```
 <details>
 <summary><span style="font-weight: bold;">Command Line Arguments for train.py</span></summary>
