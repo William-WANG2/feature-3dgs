@@ -260,3 +260,88 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'feature_map': feature_map,
             "depth": depth} ###d
 
+from gsplat.project_gaussians import project_gaussians
+from gsplat.sh import spherical_harmonics
+from gsplat.rasterize import rasterize_gaussians
+def gsplat_render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, override_color=None):
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    focal_length_x = viewpoint_camera.image_width / (2 * tanfovx)
+    focal_length_y = viewpoint_camera.image_height / (2 * tanfovy)
+
+    img_height = int(viewpoint_camera.image_height)
+    img_width = int(viewpoint_camera.image_width)
+
+    xys, depths, radii, conics, comp, num_tiles_hit, cov3d = project_gaussians(  # type: ignore
+        means3d=pc.get_xyz,
+        scales=pc.get_scaling,
+        glob_scale=scaling_modifier,
+        quats=pc.get_rotation,
+        viewmat=viewpoint_camera.world_view_transform.T,
+        # projmat=viewpoint_camera.full_projection.T,
+        fx=focal_length_x,
+        fy=focal_length_y,
+        cx=img_width / 2.,
+        cy=img_height / 2.,
+        img_height=img_height,
+        img_width=img_width,
+        block_width=16,
+    )
+
+    try:
+        xys.retain_grad()
+    except:
+        pass
+
+    viewdirs = pc.get_xyz.detach() - viewpoint_camera.camera_center  # (N, 3)
+    # viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+    rgbs = spherical_harmonics(pc.active_sh_degree, viewdirs, pc.get_features)
+    rgbs = torch.clamp(rgbs + 0.5, min=0.0)  # type: ignore
+
+    # opacities = pc.get_opacity
+    # if self.anti_aliased is True:
+    #     opacities = opacities * comp[:, None]
+
+    def rasterize_features(input_features, bg, distilling: bool = False):
+        opacities = pc.get_opacity
+        if distilling is True:
+            opacities = opacities.detach()
+        return rasterize_gaussians(  # type: ignore
+            xys,
+            depths,
+            radii,
+            conics,
+            num_tiles_hit,  # type: ignore
+            input_features,
+            opacities,
+            img_height=img_height,
+            img_width=img_width,
+            block_width=16,
+            background=bg,
+            return_alpha=False,
+        ).permute(2, 0, 1)
+
+    rgb = rasterize_features(rgbs, bg_color)
+    depth = rasterize_features(depths.unsqueeze(-1).repeat(1, 3), torch.zeros((3,), dtype=torch.float, device=bg_color.device))
+
+    semantic_features = pc.get_semantic_feature.squeeze(1)
+    output_semantic_feature_map_list = []
+    chunk_size = 32
+    bg_color = torch.zeros((chunk_size,), dtype=torch.float, device=bg_color.device)
+    for i in range(semantic_features.shape[-1] // chunk_size):
+        start = i * chunk_size
+        output_semantic_feature_map_list.append(rasterize_features(
+            semantic_features[..., start:start + chunk_size],
+            bg_color,
+            distilling=True,
+        ))
+    feature_map = torch.concat(output_semantic_feature_map_list, dim=0)
+
+    return {
+        "render": rgb,
+        "depth": depth[:1],
+        'feature_map': feature_map,
+        "viewspace_points": xys,
+        "visibility_filter": radii > 0,
+        "radii": radii,
+    }

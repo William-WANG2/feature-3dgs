@@ -66,6 +66,10 @@ def main(args: argparse.Namespace) -> None:
     os.makedirs(args.output, exist_ok=True)
 
     for t in targets:
+        # fix the nerf synthetic data bug
+        if "depth" in t:
+            print(f"Skipping '{t}' because it contains 'depth'...")
+            continue
         print(f"Processing '{t}'...")
         img_name = t.split(os.sep)[-1].split(".")[0]
         image = cv2.imread(t) # (1423, 1908, 3)

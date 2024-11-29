@@ -242,7 +242,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, semantic_f
             FovY = fovy 
             FovX = fovx
 
-            
+            # print("Image_Name: ", image_name)
+            # print("Joint Path: ", os.path.join(semantic_feature_folder, image_name))
             semantic_feature_path = os.path.join(semantic_feature_folder, image_name) + '_fmap_CxHxW.pt' 
             semantic_feature_name = os.path.basename(semantic_feature_path).split(".")[0]
             semantic_feature = torch.load(semantic_feature_path)
@@ -261,9 +262,9 @@ def readNerfSyntheticInfo(path, foundation_model, white_background, eval, extens
         semantic_feature_dir = "rgb_feature_langseg" 
 
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, semantic_feature_folder=os.path.join(path, semantic_feature_dir)) 
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, semantic_feature_folder=os.path.join(path, semantic_feature_dir, "train")) 
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, semantic_feature_folder=os.path.join(path, semantic_feature_dir)) 
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, semantic_feature_folder=os.path.join(path, semantic_feature_dir, "test")) 
     
     if not eval:
         train_cam_infos.extend(test_cam_infos)
