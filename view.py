@@ -2,7 +2,7 @@ import sys
 from scene import Scene, GaussianModel
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import gsplat_render as render, network_gui
 from utils.image_utils import render_net_image
 import torch
 
