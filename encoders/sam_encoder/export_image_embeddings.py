@@ -97,7 +97,7 @@ if __name__ == "__main__":
 
 # import numpy as np
 # import torch
-# import matplotlib.pyplot as plt
+# import matplotlib.from gaussian_renderer import render, network_guipyplot as plt
 # import cv2
 
 

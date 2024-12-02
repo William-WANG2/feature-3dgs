@@ -259,7 +259,9 @@ def readNerfSyntheticInfo(path, foundation_model, white_background, eval, extens
     if foundation_model =='sam':
         semantic_feature_dir = "sam_embeddings" 
     elif foundation_model =='lseg':
-        semantic_feature_dir = "rgb_feature_langseg" 
+        semantic_feature_dir = "rgb_feature_langseg"
+    elif foundation_model =='dinov2':
+        semantic_feature_dir = "dino_embeddings"
 
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, semantic_feature_folder=os.path.join(path, semantic_feature_dir, "train")) 
