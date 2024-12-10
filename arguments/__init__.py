@@ -94,6 +94,79 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
         super().__init__(parser, "Optimization Parameters")
 
+class ModelParamsMatching(ModelParams):
+    def __init__(self, parser, postfix=""):
+        """
+        Initialize model parameters with postfixed argument names
+        Args:
+            parser: ArgumentParser instance
+            postfix: String to append to argument names (e.g., "_1", "_2")
+        """
+        # Store the postfix
+        self.postfix = postfix
+        
+        # Initialize attributes with postfixed names
+        self.sh_degree = 3
+        self._source_path = ""
+        self._foundation_model = ""
+        self._model_path = ""
+        self._images = "images"
+        self._resolution = -1
+        self._white_background = False
+        # setattr(self, f"_source_path{postfix}", "")
+        # setattr(self, f"_foundation_model{postfix}", "")
+        # setattr(self, f"_model_path{postfix}", "")
+        # setattr(self, f"_images{postfix}", "images")
+        # setattr(self, f"_resolution{postfix}", -1)
+        # setattr(self, f"_white_background{postfix}", False)
+        self.data_device = "cuda"
+        self.eval = False
+        self.speedup = False
+        self.render_items = ['RGB', 'Depth', 'Edge', 'Normal', 'Curvature', 'Feature Map']
+        
+        # Initialize the parser group with a unique name
+        group = parser.add_argument_group(f"Model{postfix} Parameters")
+        
+        # Add arguments with postfixed names
+        for key, value in vars(self).items():
+            if key.startswith("_"):
+                # Remove the leading underscore for the argument name
+                base_key = key[1:]
+                # Add the postfix to create unique argument names
+                arg_name = f"--{base_key}{postfix}"
+                # Create unique shorthand by combining first letter with postfix number
+                short_name = f"-{base_key[0]}{postfix[-1]}"  # e.g., -s1, -s2
+                
+                t = type(value)
+                if t == bool:
+                    group.add_argument(arg_name, short_name, default=value, action="store_true")
+                else:
+                    group.add_argument(arg_name, short_name, default=value, type=t)
+            elif key not in ["postfix", "render_items"]:  # Skip postfix and render_items
+                arg_name = f"--{key}{postfix}"
+                t = type(value)
+                if t == bool:
+                    group.add_argument(arg_name, default=value, action="store_true")
+                else:
+                    group.add_argument(arg_name, default=value, type=t)
+
+    def extract(self, args):
+        """
+        Extract parameters from parsed arguments, handling postfixed names
+        """
+        group = GroupParams()
+        for arg_name, value in vars(args).items():
+            # Remove the postfix from the argument name
+            base_name = arg_name.replace(self.postfix, "")
+            if hasattr(self, base_name) or hasattr(self, f"_{base_name}"):
+                # Set the attribute with the original name (including postfix)
+                if arg_name.startswith(base_name):
+                    setattr(group, base_name, value)
+        
+        if hasattr(group, "source_path"):
+            group.source_path = os.path.abspath(group.source_path)
+        return group
+
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
