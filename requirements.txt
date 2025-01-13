@@ -24,3 +24,17 @@ git+https://github.com/zhanghang1989/PyTorch-Encoding/
 pycocotools
 onnxruntime 
 onnx
+
+#./instant-nsr-pl/
+omegaconf==2.2.3
+nerfacc==0.3.3
+imageio-ffmpeg
+PyMCubes
+pyransac3d
+torch_efficient_distloss
+tensorboard
+trimesh
+git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
+
+# fix post-training but using gsplat
+git+https://github.com/nerfstudio-project/gsplat.git@v0.1.10
