@@ -9,8 +9,14 @@ import numpy as np
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 
+# dirty fix for the import error of the original instant_nsr_pl package
+sys.path.append(os.path.abspath("./instant_nsr_pl"))
+from instant_nsr_pl.models.neus import NeuSModel
+import systems
+from instant_nsr_pl.utils.misc import load_config
+
 class KNNMatchingInterpolation:
-    def __init__(self, dataset1, dataset2, pipe, iteration1=None, iteration2=None):
+    def __init__(self, dataset1, dataset2, pipe, iteration1=None, iteration2=None, replace_2_from_1_part=False):
         """
         Initialize two Gaussian models from different datasets
         Args:
@@ -31,6 +37,71 @@ class KNNMatchingInterpolation:
         # Store pipeline parameters
         self.pipe = pipe
 
+        # Store placeholders for neus model ckpt and config path
+        self.neus_model_ckpt_1 = None
+        self.neus_config_path_1 = None
+        self.neus_model_ckpt_2 = None
+        self.neus_config_path_2 = None
+
+        if replace_2_from_1_part:
+            max_x_1, max_y_1, max_z_1 = self.gaussians1.get_xyz.max(dim=0)[0]
+            min_x_1, min_y_1, min_z_1 = self.gaussians1.get_xyz.min(dim=0)[0]
+            min_x_2, min_y_2, min_z_2 = self.gaussians2.get_xyz.min(dim=0)[0]
+            max_x_2, max_y_2, max_z_2 = self.gaussians2.get_xyz.max(dim=0)[0]
+
+            # Define the range for replacement
+            threshold_x_1 = min_x_1 + 0.6 * (max_x_1 - min_x_1)
+            # threshold_y_1 = min_y_1 + 0.05 * (max_y_1 - min_y_1)
+            # threshold_z_1 = min_z_1 + 0.05 * (max_z_1 - min_z_1   )
+            threshold_x_2 = min_x_2 + 1 * (max_x_2 - min_x_2)
+            # threshold_y_2 = min_y_2 + 0.05 * (max_y_2 - min_y_2)
+            # threshold_z_2 = min_z_2 + 0.05 * (max_z_2 - min_z_2)
+
+            # Create a mask for points in gaussians1 that fall within the specified range
+            mask1 = (self.gaussians1.get_xyz[:, 0] >= min_x_1) & (self.gaussians1.get_xyz[:, 0] <= threshold_x_1) \
+                # & \
+                #      (self.gaussians1.get_xyz[:, 1] >= min_y) & (self.gaussians1.get_xyz[:, 1] <= threshold_y) & \
+                #      (self.gaussians1.get_xyz[:, 2] >= min_z) & (self.gaussians1.get_xyz[:, 2] <= threshold_z)
+
+            # Create a mask for points in gaussians2 that fall within the specified range
+            mask2 = (self.gaussians2.get_xyz[:, 0] >= min_x_2) & (self.gaussians2.get_xyz[:, 0] <= threshold_x_1) \
+                # & \
+                #      (self.gaussians2.get_xyz[:, 1] >= min_y) & (self.gaussians2.get_xyz[:, 1] <= threshold_y) & \
+                #      (self.gaussians2.get_xyz[:, 2] >= min_z) & (self.gaussians2.get_xyz[:, 2] <= threshold_z)
+
+            print("Number of points in gaussians1 before removing points: ", self.gaussians1._xyz.shape[0])
+            print("Number of points in gaussians2 before removing points: ", self.gaussians2._xyz.shape[0])
+            # Remove points in gaussians1 that are masked by mask1
+            self.gaussians1._xyz = self.gaussians1._xyz[~mask1]
+            self.gaussians1._features_dc = self.gaussians1._features_dc[~mask1]
+            self.gaussians1._features_rest = self.gaussians1._features_rest[~mask1]
+            self.gaussians1._opacity = self.gaussians1._opacity[~mask1]
+            self.gaussians1._scaling = self.gaussians1._scaling[~mask1]
+            self.gaussians1._rotation = self.gaussians1._rotation[~mask1]
+            self.gaussians1._semantic_feature = self.gaussians1._semantic_feature[~mask1]
+            print("Number of points in gaussians1 after removing points: ", self.gaussians1._xyz.shape[0])
+
+            part_gaussians2_xyz = self.gaussians2._xyz[mask2]
+            part_gaussians2_features_dc = self.gaussians2._features_dc[mask2]
+            part_gaussians2_features_rest = self.gaussians2._features_rest[mask2]
+            part_gaussians2_opacity = self.gaussians2._opacity[mask2]
+            part_gaussians2_scaling = self.gaussians2._scaling[mask2]
+            part_gaussians2_rotation = self.gaussians2._rotation[mask2]
+            part_gaussians2_semantic_feature = self.gaussians2._semantic_feature[mask2]
+
+            print("Number of points in gaussians2 after removing points: ", part_gaussians2_xyz.shape[0])
+
+            # Extend gaussians1 with points from gaussians2 that are masked by mask2
+            self.gaussians1._xyz = torch.cat((self.gaussians1._xyz, part_gaussians2_xyz), dim=0)
+            self.gaussians1._features_dc = torch.cat((self.gaussians1._features_dc, part_gaussians2_features_dc), dim=0)
+            self.gaussians1._features_rest = torch.cat((self.gaussians1._features_rest, part_gaussians2_features_rest), dim=0)
+            self.gaussians1._opacity = torch.cat((self.gaussians1._opacity, part_gaussians2_opacity), dim=0)
+            self.gaussians1._scaling = torch.cat((self.gaussians1._scaling, part_gaussians2_scaling), dim=0)
+            self.gaussians1._rotation = torch.cat((self.gaussians1._rotation, part_gaussians2_rotation), dim=0)
+            self.gaussians1._semantic_feature = torch.cat((self.gaussians1._semantic_feature, part_gaussians2_semantic_feature), dim=0)
+
+            print("Number of points in gaussians1 after adding points: ", self.gaussians1._xyz.shape[0])
+
     @staticmethod
     def parse_args():
         parser = ArgumentParser(description="KNN Matching parameters")
@@ -44,6 +115,18 @@ class KNNMatchingInterpolation:
         # Add iterations for both models
         parser.add_argument('--iteration_1', type=int, default=7000)
         parser.add_argument('--iteration_2', type=int, default=7000)
+
+        # Add matching_features
+        parser.add_argument('--matching_features', nargs='+', type=str, default=['semantic_feature', 'dir_centers'], choices=['semantic_feature', 'xyz', 'sr_features', 'dir_centers', 'sdf'])
+
+        # Add interpolation_features
+        parser.add_argument('--interpolation_features', nargs='+', type=str, default=['xyz', 'features_dc', 'features_rest', 'scaling', 'opacity', 'rotation'], choices=['xyz', 'features_dc', 'features_rest', 'scaling', 'opacity', 'rotation', 'semantic_feature'])
+
+        # Add neus model ckpt and config path
+        parser.add_argument('--neus_model_ckpt_1', type=str, default='./exp/neus-blender-dog/example@20250112-191501/ckpt/epoch=0-step=20000.ckpt')
+        parser.add_argument('--neus_config_path_1', type=str, default='./instant_nsr_pl/configs/neus-blender.yaml')
+        parser.add_argument('--neus_model_ckpt_2', type=str, default='./exp/neus-blender-cat/example@20250110-230313/ckpt/epoch=0-step=20000.ckpt')
+        parser.add_argument('--neus_config_path_2', type=str, default='./instant_nsr_pl/configs/neus-blender.yaml')
         
         args = parser.parse_args(sys.argv[1:])
         return args, model_params1, model_params2, pipe_params
@@ -57,27 +140,102 @@ class KNNMatchingInterpolation:
         self.gaussians2 = GaussianModel(dataset2.sh_degree)
         self.scene2 = Scene(dataset2, self.gaussians2, load_iteration=iteration2, shuffle=False)
         self.pipe = pipe
-
-    def compute_bidirectional_knn(self, k=1):
+    
+    def get_gaussian_sdf(self, xyz, neus_model_ckpt, config_path):
         """
-        Compute bidirectional KNN matching between two GaussianModels using semantic features
+            Get SDF of each GaussianModel from NeusModel
+            Args:
+                xyz: xyz coordinates of the points to get SDF
+                neus_model_ckpt: path to the NeusModel checkpoint
+                config_path: path to the NeusModel config file
+        """
+        config = load_config(config_path)
+        neus_model = systems.make('neus-system', config, neus_model_ckpt)
+        geometry = neus_model.model.geometry
+        sdf = geometry.forward(xyz, with_grad=False, with_feature=False, with_laplace=False)
+        return sdf
+
+    def compute_bidirectional_knn(self, k=1, features_to_use=['semantic_feature']):
+        """
+        Compute bidirectional KNN matching between two GaussianModels using multiple features
         Args:
             k: Number of nearest neighbors (default=1)
+            features_to_use: List of feature names to use for matching (e.g., ['semantic_feature', 'xyz'])
         Returns:
-            matches_1to2: Indices of nearest neighbors in gaussians2 for each point in gaussians1 dim: (N1, k) format in numpy
-            matches_2to1: Indices of nearest neighbors in gaussians1 for each point in gaussians2 dim: (N2, k) format in numpy
+            matches_1to2: Indices of nearest neighbors in gaussians2 for each point in gaussians1 dim: (N1, k)
+            matches_2to1: Indices of nearest neighbors in gaussians1 for each point in gaussians2 dim: (N2, k)
         """
-        # Get semantic features from both models and reshape them
-        features1 = self.gaussians1.get_semantic_feature.detach().squeeze(-1).cpu().numpy()  # (N1, semantic_feature_size)
-        features2 = self.gaussians2.get_semantic_feature.detach().squeeze(-1).cpu().numpy()  # (N2, semantic_feature_size)
-        features1 = features1.squeeze(1)
-        features2 = features2.squeeze(1)
+        features1_list = []
+        features2_list = []
+        
+        for feature in features_to_use:
+            if feature == 'semantic_feature':
+                feat1 = self.gaussians1.get_semantic_feature.detach().squeeze(-1).cpu().numpy()
+                feat2 = self.gaussians2.get_semantic_feature.detach().squeeze(-1).cpu().numpy()
+                print("min, max of semantic_feature_1: ", feat1.min(), feat1.max())
+                print("min, max of semantic_feature_2: ", feat2.min(), feat2.max())
+                feat1 = feat1.squeeze(1)
+                feat2 = feat2.squeeze(1)
+                weight = 2 / np.sqrt(feat1.shape[1])
+                feat1 = feat1 * weight
+                feat2 = feat2 * weight
+            elif feature == 'xyz':
+                feat1 = self.gaussians1.get_xyz.detach().cpu().numpy()
+                feat2 = self.gaussians2.get_xyz.detach().cpu().numpy()
+                weight = 1 / np.sqrt(feat1.shape[1])
+                feat1 = feat1 * weight
+                feat2 = feat2 * weight
+            elif feature == 'sdf':
+                xyz_1 = self.gaussians1.get_xyz
+                xyz_2 = self.gaussians2.get_xyz
+                sdf_1 = self.get_gaussian_sdf(xyz_1, self.neus_model_ckpt_1, self.neus_config_path_1).unsqueeze(-1)
+                sdf_2 = self.get_gaussian_sdf(xyz_2, self.neus_model_ckpt_2, self.neus_config_path_2).unsqueeze(-1)
+                print("abs min, max of sdf_1: ", sdf_1.abs().min(), sdf_1.abs().max())
+                print("abs min, max of sdf_2: ", sdf_2.abs().min(), sdf_2.abs().max())
+                feat1 = sdf_1.detach().cpu().numpy()
+                feat2 = sdf_2.detach().cpu().numpy()
+                weight = 5 / np.sqrt(feat1.shape[1])
+                feat1 = feat1 * weight
+                feat2 = feat2 * weight
+            elif feature == 'sr_features':
+                feat1 = self.gaussians1.get_features.flatten(start_dim=1).detach().cpu().numpy()
+                feat2 = self.gaussians2.get_features.flatten(start_dim=1).detach().cpu().numpy()
+                weight = 1 / np.sqrt(feat1.shape[1])
+                feat1 = feat1 * weight
+                feat2 = feat2 * weight
+            elif feature == 'dir_centers':
+                xyz_center_1 = self.gaussians1.get_xyz.mean(dim=0).detach().cpu().numpy()
+                xyz_center_2 = self.gaussians2.get_xyz.mean(dim=0).detach().cpu().numpy()
+                xyzs_1 = self.gaussians1.get_xyz.detach().cpu().numpy()
+                xyzs_2 = self.gaussians2.get_xyz.detach().cpu().numpy()
+                feat1 = xyzs_1 - xyz_center_1
+                feat2 = xyzs_2 - xyz_center_2
+                print("min, max of dir_centers_1: ", feat1.min(), feat1.max())
+                print("min, max of dir_centers_2: ", feat2.min(), feat2.max())
+                weight = 1 / np.sqrt(feat1.shape[1])
+                feat1 = feat1 * weight
+                feat2 = feat2 * weight
+            else:
+                raise ValueError(f"Invalid feature to use: {feature}")
+            
+            features1_list.append(feat1)
+            features2_list.append(feat2)
+        
+        # Concatenate all features
+        features1 = np.concatenate(features1_list, axis=1)
+        features2 = np.concatenate(features2_list, axis=1)
+        
         # Ensure features are float32 (required by faiss)
         features1 = features1.astype(np.float32)
         features2 = features2.astype(np.float32)
-
+        
+        print(f"Using features for KNN matching: {features_to_use}")
+        print("Combined features1 shape: ", features1.shape)
+        print("Combined features2 shape: ", features2.shape)
+        
         # Create faiss index for fast KNN
         d = features1.shape[1]  # feature dimension
+        print("feature dimension: ", d)
         
         # Use GPU if available
         if torch.cuda.is_available():
@@ -111,6 +269,11 @@ class KNNMatchingInterpolation:
         #     matches_2to1 = matches_2to1.cuda()
 
         return matches_1to2, matches_2to1
+    
+    def soft_matching(self, k=1, features_to_use=['semantic_feature']):
+        """
+        Compute soft matching between two GaussianModels using multiple features
+        """
 
     def create_matched_gaussians(self):
         """
@@ -142,7 +305,6 @@ class KNNMatchingInterpolation:
         for i in range(self.matches_2to1.shape[0]):
             k_values_2[i] += 1
             k_values_1[self.matches_2to1[i, 0]] += 1
-        
         # Create indices for duplicating gaussians
         indices_1 = []  # Indices into gaussians1
         indices_2 = []  # Indices into gaussians2
@@ -240,9 +402,46 @@ class KNNMatchingInterpolation:
             'active_sh_degree': self.gaussians2.active_sh_degree
         }
 
+        # Create reordered tensors based on new_matches
+        reordered_indices1 = []
+        reordered_indices2 = []
+        for match in new_matches:
+            reordered_indices1.append(match[0])
+            reordered_indices2.append(match[1])
+        
+        # Convert to tensors and move to same device
+        reordered_indices1 = torch.tensor(reordered_indices1, device=device)
+        reordered_indices2 = torch.tensor(reordered_indices2, device=device)
+
+        # Reorder all attributes of new_gaussians1 and new_gaussians2
+        new_gaussians1 = {
+            'xyz': new_gaussians1['xyz'][reordered_indices1],
+            'features_dc': new_gaussians1['features_dc'][reordered_indices1],
+            'features_rest': new_gaussians1['features_rest'][reordered_indices1],
+            'scaling': new_gaussians1['scaling'][reordered_indices1],
+            'rotation': new_gaussians1['rotation'][reordered_indices1],
+            'opacity': new_gaussians1['opacity'][reordered_indices1],
+            'semantic_feature': new_gaussians1['semantic_feature'][reordered_indices1],
+            'active_sh_degree': new_gaussians1['active_sh_degree']
+        }
+
+        new_gaussians2 = {
+            'xyz': new_gaussians2['xyz'][reordered_indices2],
+            'features_dc': new_gaussians2['features_dc'][reordered_indices2],
+            'features_rest': new_gaussians2['features_rest'][reordered_indices2],
+            'scaling': new_gaussians2['scaling'][reordered_indices2],
+            'rotation': new_gaussians2['rotation'][reordered_indices2],
+            'opacity': new_gaussians2['opacity'][reordered_indices2],
+            'semantic_feature': new_gaussians2['semantic_feature'][reordered_indices2],
+            'active_sh_degree': new_gaussians2['active_sh_degree']
+        }
+
         self.new_gaussians1 = new_gaussians1
         self.new_gaussians2 = new_gaussians2
         self.new_matches = new_matches
+
+        print("Number of points in new_gaussians1: ", new_gaussians1['xyz'].shape[0])
+        print("Number of points in new_gaussians2: ", new_gaussians2['xyz'].shape[0])
 
         return new_gaussians1, new_gaussians2, new_matches
 
@@ -264,7 +463,7 @@ class KNNMatchingInterpolation:
             l.append('semantic_{}'.format(i))
         return l
 
-    def save_new_gaussians(self, gaussians, path_gaussian):
+    def save_new_gaussians(self, gaussians, path_gaussian, is_interpolation=False):
         mkdir_p(os.path.dirname(path_gaussian))
         xyz = gaussians['xyz'].detach().cpu().numpy()
         normals = np.zeros_like(xyz)
@@ -273,22 +472,29 @@ class KNNMatchingInterpolation:
         opacities = gaussians['opacity'].detach().cpu().numpy()
         scale = gaussians['scaling'].detach().cpu().numpy()
         rotation = gaussians['rotation'].detach().cpu().numpy()
-        semantic_feature = gaussians['semantic_feature'].detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        if not is_interpolation:
+            semantic_feature = gaussians['semantic_feature'].detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+        if is_interpolation:
+            dtype_full = [e for e in dtype_full if 'semantic' not in e[0]]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, semantic_feature), axis=1) 
+        if not is_interpolation:
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, semantic_feature), axis=1) 
+        else:
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1) 
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path_gaussian)
     
 
-    def export_new_gaussians(self, path_gaussian1, path_gaussian2):
-        self.save_new_gaussians(self.new_gaussians1, path_gaussian1)
-        self.save_new_gaussians(self.new_gaussians2, path_gaussian2)
+    def export_new_gaussians(self, path_gaussian1, path_gaussian2, is_interpolation=False):
+        self.save_new_gaussians(self.new_gaussians1, path_gaussian1, is_interpolation)
+        self.save_new_gaussians(self.new_gaussians2, path_gaussian2, is_interpolation)
 
-    def interpolate_gaussians(self, output_path, t=60):
+
+    def linear_interpolate_gaussians(self, output_path, t=60, features_to_interpolate=[]):
         """
         Linearly interpolate between matched gaussians and save the sequence as PLY files.
         
@@ -339,27 +545,27 @@ class KNNMatchingInterpolation:
             interpolated = {}
             
             # Linear interpolation for most attributes
-            for key in ['xyz', 'features_dc', 'features_rest', 'scaling', 'opacity', 'semantic_feature']:
-                if key == 'semantic_feature':
-                    interpolated[key] = self.new_gaussians1[key]
-                else:
+            for key in ['xyz', 'features_dc', 'features_rest', 'scaling', 'opacity']:
+                if key in features_to_interpolate:
                     interpolated[key] = (1 - ratio) * self.new_gaussians1[key] + ratio * self.new_gaussians2[key]
-                
-
-            
+                else:
+                    interpolated[key] = self.new_gaussians1[key]
             # SLERP for rotation quaternions
-            interpolated['rotation'] = slerp(
-                self.new_gaussians1['rotation'],
-                self.new_gaussians2['rotation'],
-                ratio
-            )
+            if 'rotation' in features_to_interpolate:
+                interpolated['rotation'] = slerp(
+                    self.new_gaussians1['rotation'],
+                    self.new_gaussians2['rotation'],
+                    ratio
+                )
+            else:
+                interpolated['rotation'] = self.new_gaussians1['rotation']
             
             # Copy active_sh_degree
             interpolated['active_sh_degree'] = self.new_gaussians1['active_sh_degree']
             
             # Save the interpolated gaussians
             frame_path = os.path.join(output_path, f'frame_{i:04d}.ply')
-            self.save_new_gaussians(interpolated, frame_path)
+            self.save_new_gaussians(interpolated, frame_path, is_interpolation=True)
 
     def random_sample_matched_gaussians(self, prec=0.01):
         """
@@ -440,12 +646,22 @@ if __name__ == "__main__":
     dataset1 = model_params1.extract(args)
     dataset2 = model_params2.extract(args)
     pipe = pipe_params.extract(args)
-    
+
+    matching_features = args.matching_features # list of features to use for matching [str]
+    interpolation_features = args.interpolation_features # list of features to use for interpolation [str]
+
     # Create KNN matching instance
     print("Creating KNN matching instance. Loading gaussians...")
-    matcher = KNNMatchingInterpolation(dataset1, dataset2, pipe, args.iteration_1, args.iteration_2)
+    matcher = KNNMatchingInterpolation(dataset1, dataset2, pipe, args.iteration_1, args.iteration_2, replace_2_from_1_part=False)
+
+    if "sdf" in matching_features:
+        matcher.neus_model_ckpt_1 = args.neus_model_ckpt_1
+        matcher.neus_config_path_1 = args.neus_config_path_1
+        matcher.neus_model_ckpt_2 = args.neus_model_ckpt_2
+        matcher.neus_config_path_2 = args.neus_config_path_2
+
     print("Computing bidirectional KNN... Getting matches...")
-    matcher.compute_bidirectional_knn(k=1)
+    matcher.compute_bidirectional_knn(k=1, features_to_use=matching_features)
     print("Creating matched gaussians...")
     matcher.create_matched_gaussians()
     print("Exporting new gaussians...")
@@ -460,8 +676,8 @@ if __name__ == "__main__":
     matcher.export_new_gaussians(path_new_gaussian1, path_new_gaussian2)
     # print("Randomly sampling matched gaussians...")
     # matcher.random_sample_matched_gaussians(prec=0.01)
-    # print("Interpolating gaussians...")
+    print("Interpolating gaussians...")
     output_path_dir = os.path.join(dataset1.model_path, "point_cloud", "interpolation")
-    matcher.interpolate_gaussians(output_path_dir, t=60)
+    matcher.linear_interpolate_gaussians(output_path_dir, t=120, features_to_interpolate=interpolation_features)
 
 
