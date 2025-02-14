@@ -1,4 +1,6 @@
+import gc
 import os
+import pickle
 import sys
 from scene import Scene, GaussianModel
 from argparse import ArgumentParser
@@ -8,6 +10,12 @@ import faiss
 import numpy as np
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 
 # dirty fix for the import error of the original instant_nsr_pl package
 sys.path.append(os.path.abspath("./instant_nsr_pl"))
@@ -141,6 +149,14 @@ class KNNMatchingInterpolation:
         self.scene2 = Scene(dataset2, self.gaussians2, load_iteration=iteration2, shuffle=False)
         self.pipe = pipe
     
+    def release_gaussians(self):
+        del self.gaussians1
+        del self.gaussians2
+        del self.scene1
+        del self.scene2
+        gc.collect()
+        torch.cuda.empty_cache()
+    
     def get_gaussian_sdf(self, xyz, neus_model_ckpt, config_path):
         """
             Get SDF of each GaussianModel from NeusModel
@@ -155,15 +171,23 @@ class KNNMatchingInterpolation:
         sdf = geometry.forward(xyz, with_grad=False, with_feature=False, with_laplace=False)
         return sdf
 
-    def compute_bidirectional_knn(self, k=1, features_to_use=['semantic_feature']):
+    def compute_bidirectional_knn(self, k=1, features_to_use=['semantic_feature'], num_nearest_neighbors=20):
         """
         Compute bidirectional KNN matching between two GaussianModels using multiple features
         Args:
-            k: Number of nearest neighbors (default=1)
+            k: Number of nearest neighbors for high-dimensional feature matching (default=1)
             features_to_use: List of feature names to use for matching (e.g., ['semantic_feature', 'xyz'])
+            num_nearest_neighbors: Number of nearest neighbors for position matching (default=20)
+
         Returns:
             matches_1to2: Indices of nearest neighbors in gaussians2 for each point in gaussians1 dim: (N1, k)
             matches_2to1: Indices of nearest neighbors in gaussians1 for each point in gaussians2 dim: (N2, k)
+            nearest_neighbors_1to1: Indices of nearest neighbors in gaussians1 for each point in gaussians1 dim: (N1, num_nearest_neighbors)
+            nearest_neighbors_2to2: Indices of nearest neighbors in gaussians2 for each point in gaussians2 dim: (N2, num_nearest_neighbors)
+            features1: Features of gaussians1 dim: (N1, D)
+            features2: Features of gaussians2 dim: (N2, D)
+            xyz_1: xyz coordinates of gaussians1 dim: (N1, 3)
+            xyz_2: xyz coordinates of gaussians2 dim: (N2, 3)
         """
         features1_list = []
         features2_list = []
@@ -255,27 +279,219 @@ class KNNMatchingInterpolation:
         # Compute KNN in both directions
         distances_2to1, matches_2to1 = index1.search(features2, k)  # N2 -> N1
         distances_1to2, matches_1to2 = index2.search(features1, k)  # N1 -> N2
+        # print the max, min, median, mean  of distances_2to1 and distances_1to2
+        print(f"Max distance 2to1: {distances_2to1.max()}")
+        print(f"Min distance 2to1: {distances_2to1.min()}")
+        print(f"Max distance 1to2: {distances_1to2.max()}")
+        print(f"Min distance 1to2: {distances_1to2.min()}")
+        print(f"Median distance 2to1: {np.median(distances_2to1)}")
+        print(f"Median distance 1to2: {np.median(distances_1to2)}")
+        print(f"Mean distance 2to1: {np.mean(distances_2to1)}")
+        print(f"Mean distance 1to2: {np.mean(distances_1to2)}")
 
-        # store the matches in numpy array
-        self.matches_1to2 = matches_1to2
-        self.matches_2to1 = matches_2to1
-
-        # # Convert to torch tensors and move to GPU if available
-        # matches_1to2 = torch.from_numpy(matches_1to2).squeeze(-1)
-        # matches_2to1 = torch.from_numpy(matches_2to1).squeeze(-1)
+        # find nearest neighbors for each point in gaussians1 and gaussians2 using positions
+        xyz_1 = self.gaussians1.get_xyz.detach().cpu().numpy()
+        xyz_2 = self.gaussians2.get_xyz.detach().cpu().numpy()
         
-        # if torch.cuda.is_available():
-        #     matches_1to2 = matches_1to2.cuda()
-        #     matches_2to1 = matches_2to1.cuda()
+        d = xyz_1.shape[1]
+        xyz_1 = xyz_1.astype(np.float32)
+        xyz_2 = xyz_2.astype(np.float32)
+        index1 = faiss.IndexFlatL2(d)
+        index2 = faiss.IndexFlatL2(d)
+        index1.add(xyz_1)
+        index2.add(xyz_2)
+        distances_1to1, nearest_neighbors_1to1 = index1.search(xyz_1, num_nearest_neighbors)  # N1 -> N1
+        distances_2to2, nearest_neighbors_2to2 = index2.search(xyz_2, num_nearest_neighbors)  # N2 -> N2
 
-        return matches_1to2, matches_2to1
-    
-    def soft_matching(self, k=1, features_to_use=['semantic_feature']):
-        """
-        Compute soft matching between two GaussianModels using multiple features
-        """
+        return matches_1to2, matches_2to1, nearest_neighbors_1to1, nearest_neighbors_2to2, features1, features2, xyz_1, xyz_2
 
-    def create_matched_gaussians(self):
+    def soft_matching_optimization_minibatch(
+        self,
+        feat1,          # (N1, D)
+        feat2,          # (N2, D)
+        xyz2,           # (N2, 3)
+        matches_1to2,   # (N1, 1)
+        neighbor_ids,   # list of neighbors for each i in [0..N1-1], shape: (N1, k)
+        batch_size=1,
+        num_epochs=100,
+        lr=10,
+        lambda_smooth=1.0,
+        lambda_entropy=0.1
+    ):
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("Using device:", device)
+
+        # Move data to CPU first (or keep it on CPU if too large)
+        feat1_cpu = torch.tensor(feat1, dtype=torch.float32, device='cpu')
+        feat2_cpu = torch.tensor(feat2, dtype=torch.float32, device='cpu')
+        xyz2_cpu  = torch.tensor(xyz2, dtype=torch.float32, device='cpu')
+
+        N1, D = feat1_cpu.shape
+        N2, _ = feat2_cpu.shape
+
+        print("N1, D: ", N1, D)
+        print("N2, _: ", N2, _)
+
+        # -------------------------------------------
+        # Create M on CPU as a normal (non-Parameter)
+        # -------------------------------------------
+        M_cpu = 0.2 * torch.ones((N1, N2), dtype=torch.float32, device='cpu')
+        for i in range(N1):
+            nn_idx = matches_1to2[i, 0]  # the known nearest neighbor
+            M_cpu[i, nn_idx] = 1.0
+
+        # For demonstration, do the full cdist on CPU (WARNING: big if N2 is large!)
+        dist_xyz2_cpu = torch.cdist(xyz2_cpu, xyz2_cpu, p=2)  # (N2, N2)
+        dist_xyz2_gpu = dist_xyz2_cpu.to(device)
+
+        # We'll create a simple DataLoader over row indices [0..N1-1].
+        dataset = torch.arange(N1)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+
+        for epoch in range(num_epochs):
+            # We do a manual "accumulate then update" approach. 
+            # In this example, we will do an update on each batch directly, 
+            # but you could also accumulate across an entire epoch if you wish.
+
+            total_loss = 0.0
+
+            num_batches_pass = 0
+
+            for batch_rows_cpu in loader:
+                num_batches_pass += 1
+                if num_batches_pass % 100 == 0:
+                    print(f"Passing batch {num_batches_pass}")
+
+                # Ensure these row indices are on CPU
+                batch_rows_cpu = batch_rows_cpu.to('cpu')  # shape (batch_size,)
+                # Convert them to a list or CPU tensor
+                batch_rows_list = batch_rows_cpu.tolist()
+
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # 1) Copy relevant rows of M to GPU for forward/backward
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+                # gather the needed feat1 rows on GPU:
+                feat1_batch_gpu = feat1_cpu[batch_rows_list, :].to(device)
+
+                # For the smoothness part, we also need the union_rows
+                neighbor_set = set()
+                for i_ in batch_rows_list:
+                    for nk in neighbor_ids[i_]:
+                        neighbor_set.add(nk)
+                union_rows_list = list(set(batch_rows_list).union(neighbor_set))
+                union_rows_list = sorted(union_rows_list)  # for consistency
+                batch_rows_list_local_idx_in_union_row_list = [union_rows_list.index(i) for i in batch_rows_list]
+                # print("batch_rows_list: ", batch_rows_list)
+                # print("batch_rows_list_local_idx_in_union_row_list: ", batch_rows_list_local_idx_in_union_row_list)
+                # print("union_rows_list: ", union_rows_list)
+
+                # Now gather subM_union (rows in union_rows_list)
+                subM_union_gpu = M_cpu[union_rows_list, :].clone().detach().to(device)
+                subM_union_gpu.requires_grad_(True)
+
+                subM_batch_gpu = subM_union_gpu[batch_rows_list_local_idx_in_union_row_list, :]
+
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # 2) Forward pass (feature loss, smoothness, entropy)
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+                # a) Feature loss for subM_batch_gpu
+                subM_batch_normed = torch.nn.functional.softmax(subM_batch_gpu, dim=1)
+                # diff_feat shape: (batch_size, N2, D)
+                diff_feat = feat1_batch_gpu.unsqueeze(1) - feat2_cpu.to(device).unsqueeze(0)
+                cost_feat = torch.sum(diff_feat ** 2, dim=-1)  # (batch_size, N2)
+                L_feat_batch = torch.sum(subM_batch_normed * cost_feat)
+
+                # b) Smoothness for subM_batch + neighbors
+                #    We only need the adjacency among union_rows. 
+                #    But for the final C_sub, it’s subM_batch_normed^T A_sub subM_union_normed
+                #    which yields an (N2 x N2) matrix we multiply by dist_xyz2. 
+                #    That can still be huge if N2 is large, so be careful in practice!
+
+                subM_union_normed = torch.nn.functional.softmax(subM_union_gpu, dim=1)
+
+                # Build adjacency for the local indexing of union_rows
+                row_map = {r: idx for idx, r in enumerate(union_rows_list)}
+                # A_sub: shape (batch_size, len(union_rows_list))
+                A_sub = torch.zeros((len(batch_rows_list), len(union_rows_list)), 
+                                    device=device, dtype=torch.float32)
+                for local_i, global_i in enumerate(batch_rows_list):
+                    for nk in neighbor_ids[global_i]:
+                        if nk in row_map:
+                            A_sub[local_i, row_map[nk]] = 1.0
+
+                # We also need subM_batch_normed as shape (N2, batch_size) for the product
+                # so let's be consistent:
+                subM_batch_normed_t = subM_batch_normed.transpose(0,1)  # (N2, batch_size)
+
+                # subM_union_normed: (|union_rows|, N2)
+                # We want C_sub = subM_batch_normed^T * A_sub * subM_union_normed 
+                # => shape (N2, N2)
+                #   * then multiply by dist_xyz2
+                #   * sum up
+
+                # But note: (N2, batch_size) x (batch_size, |union_rows|) => (N2, |union_rows|)
+                # Then => (N2, |union_rows|) x (|union_rows|, N2) => (N2, N2)
+                C_sub = subM_batch_normed_t @ A_sub @ subM_union_normed
+
+                L_smooth_sub = lambda_smooth * torch.sum(C_sub * dist_xyz2_gpu)
+
+                # c) Entropy loss for subM_batch
+                eps = 1e-8
+                # subM_batch_normed * log(subM_batch_normed)
+                L_entropy_batch = torch.sum(subM_batch_normed * torch.log(subM_batch_normed + eps))
+                L_entropy_batch = -lambda_entropy * L_entropy_batch
+
+                # Combine
+                L_total = L_feat_batch + L_smooth_sub + L_entropy_batch
+
+                # ~~~~~~~~~~~~~~~~~~~~~
+                # 3) Backward pass
+                # ~~~~~~~~~~~~~~~~~~~~~
+                L_total.backward()
+
+                # ~~~~~~~~~~~~~~~~~~~~~
+                # 4) Manual update
+                # ~~~~~~~~~~~~~~~~~~~~~
+
+                # We also need to update the union slice for the smoothness part if we want
+                # consistent gradients on subM_union_gpu as well.
+                # subM_union contains subM_batch.
+                # So let's do that too:
+                with torch.no_grad():
+                    grad_union = subM_union_gpu.grad
+
+                    # perform an SGD step on subM_union_gpu
+                    # subM_union_gpu = subM_union_gpu - lr * grad_union
+                    if grad_union is not None:
+                        grad_union_cpu = grad_union.to('cpu')
+                        # The rows of subM_union_gpu correspond to union_rows_list
+                        M_cpu[union_rows_list, :] -= lr * grad_union_cpu
+
+                total_loss += L_total.item()
+
+            print("grad_union_cpu shape, max: ", grad_union_cpu.shape, grad_union_cpu.max())
+            print(f"[Epoch {epoch+1}/{num_epochs}] Avg Loss = {total_loss / len(loader):.4f}")
+
+        # After training, do a final softmax on CPU (or GPU in chunks)
+        # M_cpu is our final matching matrix. Let's do a row-wise softmax and argmax:
+        with torch.no_grad():
+            # For large N1*N2, do it in chunks if needed
+            M_final = []
+            chunk_size = 1024
+            for start in range(0, N1, chunk_size):
+                end = min(start+chunk_size, N1)
+                M_chunk = M_cpu[start:end, :]  # shape (chunk_size, N2)
+                M_chunk_normed = torch.softmax(M_chunk, dim=1)
+                chunk_matches = torch.argmax(M_chunk_normed, dim=1)
+                M_final.append(chunk_matches)
+            matches_1to2_out = torch.cat(M_final, dim=0)
+
+        return matches_1to2_out.cpu().numpy()
+
+    def create_matched_gaussians(self, matches_1to2, matches_2to1):
         """
         Create matched gaussians with adjusted opacities based on number of links.
         
@@ -297,14 +513,14 @@ class KNNMatchingInterpolation:
         k_values_2 = np.zeros(self.gaussians2.get_xyz.shape[0], dtype=np.int64)
         
         # Count from matches_1to2
-        for i in range(self.matches_1to2.shape[0]):
+        for i in range(matches_1to2.shape[0]):
             k_values_1[i] += 1
-            k_values_2[self.matches_1to2[i, 0]] += 1
+            k_values_2[matches_1to2[i, 0]] += 1
             
         # Count from matches_2to1
-        for i in range(self.matches_2to1.shape[0]):
+        for i in range(matches_2to1.shape[0]):
             k_values_2[i] += 1
-            k_values_1[self.matches_2to1[i, 0]] += 1
+            k_values_1[matches_2to1[i, 0]] += 1
         # Create indices for duplicating gaussians
         indices_1 = []  # Indices into gaussians1
         indices_2 = []  # Indices into gaussians2
@@ -322,7 +538,7 @@ class KNNMatchingInterpolation:
         current_idx_2[1:] = cum_k_values_2[:-1]
 
         # Process matches_1to2
-        for i in range(self.matches_1to2.shape[0]):
+        for i in range(matches_1to2.shape[0]):
             if k_values_1[i] > 0:  # If gaussian has any links
                 # Add k copies of gaussian1[i]
                 k = int(k_values_1[i])
@@ -330,13 +546,13 @@ class KNNMatchingInterpolation:
                     indices_1.append(i)
                 
                 # Add match to matches_1to2[i]
-                j = self.matches_1to2[i, 0]
+                j = matches_1to2[i, 0]
                 new_matches.append((current_idx_1[i], current_idx_2[j]))
                 current_idx_1[i] += 1
                 current_idx_2[j] += 1
         
         # Process matches_2to1
-        for i in range(self.matches_2to1.shape[0]):
+        for i in range(matches_2to1.shape[0]):
             if k_values_2[i] > 0:  # If gaussian has any links
                 # Add k copies of gaussian2[i]
                 k = int(k_values_2[i])
@@ -344,7 +560,7 @@ class KNNMatchingInterpolation:
                     indices_2.append(i)
                 
                 # Add match to matches_2to1[i]
-                j = self.matches_2to1[i, 0]
+                j = matches_2to1[i, 0]
                 new_matches.append((current_idx_1[j], current_idx_2[i]))
                 current_idx_2[i] += 1
                 current_idx_1[j] += 1
@@ -581,7 +797,7 @@ class KNNMatchingInterpolation:
         n_samples = int(n_matches * prec)
 
 
-        # check if new_matches's elements in list contains first element of tuple and second element of tuple are unique
+        # check if new_matches's elements in list containss first element of tuple and second element of tuple are unique
         first_indices = [m[0] for m in self.new_matches]
         second_indices = [m[1] for m in self.new_matches]
         len_first_indices = len(first_indices)
@@ -660,10 +876,28 @@ if __name__ == "__main__":
         matcher.neus_model_ckpt_2 = args.neus_model_ckpt_2
         matcher.neus_config_path_2 = args.neus_config_path_2
 
-    print("Computing bidirectional KNN... Getting matches...")
-    matcher.compute_bidirectional_knn(k=1, features_to_use=matching_features)
+    print("Computing bidirectional KNN... Getting initial hard matches...")
+    matches_1to2, matches_2to1, nearest_neighbors_1to1, nearest_neighbors_2to2, features1, features2, xyz_1, xyz_2 = matcher.compute_bidirectional_knn(k=1, features_to_use=matching_features)
+    print("Refine matches using other loss terms (e.g., local closeness)...")
+    matcher.release_gaussians()
+    # matches_1to2 = matcher.soft_matching_optimization_minibatch(features1, features2, xyz_2, matches_1to2, nearest_neighbors_1to1)
+    # with open("matches_1to2.pkl", "wb") as f:
+    #     pickle.dump(matches_1to2, f)
+    # matches_2to1 = matcher.soft_matching_optimization_minibatch(features2, features1, xyz_1, matches_2to1, nearest_neighbors_2to2, 2)
+    # with open("matches_2to1.pkl", "wb") as f:
+    #     pickle.dump(matches_2to1, f)
+
+    # load matches_1to2 and matches_2to1 from files
+    # with open("matches_1to2.pkl", "rb") as f:
+    #     matches_1to2 = pickle.load(f)
+    # with open("matches_2to1.pkl", "rb") as f:
+    #     matches_2to1 = pickle.load(f)
+    # matches_1to2 = matches_1to2.reshape(-1, 1)
+    # matches_2to1 = matches_2to1.reshape(-1, 1)
+    
     print("Creating matched gaussians...")
-    matcher.create_matched_gaussians()
+    matcher = KNNMatchingInterpolation(dataset1, dataset2, pipe, args.iteration_1, args.iteration_2, replace_2_from_1_part=False)
+    matcher.create_matched_gaussians(matches_1to2, matches_2to1)
     print("Exporting new gaussians...")
     path_new_gaussian1 = os.path.join(dataset1.model_path,
                                 "point_cloud",
